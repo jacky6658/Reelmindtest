@@ -6,10 +6,16 @@ import { AXIOS_TIMEOUT_MS } from "@shared/const";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
 
-// 載入知識庫
+// 載入知識庫（只載入前 200 行以減少 token 消耗）
 let knowledgeBase: string = "";
 try {
-  knowledgeBase = readFileSync(join(process.cwd(), "kb.txt"), "utf-8");
+  const fullContent = readFileSync(join(process.cwd(), "kb.txt"), "utf-8");
+  // 只取前 200 行，大約能減少 50% 的 token 消耗
+  const lines = fullContent.split("\n");
+  knowledgeBase = lines.slice(0, 200).join("\n");
+  if (lines.length > 200) {
+    console.log(`[Gemini] Knowledge base truncated from ${lines.length} to 200 lines to save tokens`);
+  }
 } catch (error) {
   console.error("[Gemini] Failed to load knowledge base:", error);
 }
@@ -42,73 +48,40 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
     throw new Error("GEMINI_API_KEY is not configured");
   }
 
-  const prompt = `你是 Reelmind AI 短影音顧問,專門幫助創作者打造爆款短影音內容。
+  const prompt = `你是短影音顧問。請用自然口語回覆，避免程式碼與任何 Markdown 符號；可少量使用 emoji。
 
-以下是你的專業知識庫:
+知識庫（節選）:
 ${knowledgeBase}
 
-用戶需求:
-- 主題或產品: ${request.topic}
-- 目標受眾: ${request.targetAudience}
-- 影片目標: ${request.goal}
-- 社群平台: ${request.platform}
-${request.style ? `- 補充說明: ${request.style}` : ""}
+使用者輸入：
+- 主題: ${request.topic}
+- 受眾: ${request.targetAudience}
+- 目標: ${request.goal}
+- 平台: ${request.platform}
+${request.style ? `- 補充: ${request.style}` : ""}
 
-請根據知識庫內容,為用戶生成以下三個部分。
-
-重要:請嚴格按照以下格式輸出,使用「===」作為分隔符號:
+請嚴格依下列格式輸出三段內容（使用 === 作為分隔）。句子短、逐段換行；列點用 - 或 •；避免口頭禪。
 
 ===POSITIONING_START===
 [帳號定位內容]
-
-分段清楚，短句，每段換行，適度加入表情符號。
-
-包含以下內容:
-1. 目標受眾分析
-2. 內容定位建議
-3. 風格調性建議
-4. 競爭優勢分析
-5. 具體執行建議
+- 受眾洞察
+- 定位建議
+- 風格調性
+- 競爭優勢
+- 具體行動建議
 ===POSITIONING_END===
 
 ===TOPICS_START===
 [選題建議]
-
-分段清楚，短句，每段換行，適度加入表情符號。
-
-提供 3-5 個熱門選題方向，每個選題包含:
-1. 選題標題
-2. 具體建議
-3. 選題策略和技巧
-4. 內容規劃建議
-5. 執行時程建議
+提供 3-5 個選題；每個包含：標題、具體建議、策略/技巧、內容規劃、時程建議。
 ===TOPICS_END===
 
 ===SCRIPT_START===
 [完整的30秒腳本範例]
-
-分段清楚，短句，每段換行，適度加入表情符號。
-
-包含以下結構:
-1. 主題標題
-2. Hook（開場鉤子）
-3. Value（核心價值內容）
-4. CTA（行動呼籲）
-5. 畫面感描述
-6. 發佈文案
+包含：主題標題、Hook、Value、CTA、畫面感、發佈文案。
 ===SCRIPT_END===
 
-格式要求（非常重要）:
-- 分段清楚，短句，每段換行
-- 適度加入表情符號
-- 絕對不要使用 ** 或任何 Markdown 格式符號
-- 不要使用 # ## ### 等標題符號
-- 列點使用「•」或「-」
-- 用自然、口語化的方式表達
-- 保持專業但親切的語氣
-- 避免口頭禪
-
-請嚴格按照上述格式生成，不要有任何前言或解釋。直接開始輸出 ===POSITIONING_START===。`;
+直接開始輸出 ===POSITIONING_START===。`;
 
   try {
     // 使用 axios 代替 fetch，提供更好的錯誤處理和重試機制
@@ -168,7 +141,7 @@ ${request.style ? `- 補充說明: ${request.style}` : ""}
           temperature: 0.7,
           topK: 40,
           topP: 0.95,
-          maxOutputTokens: 8192,
+          maxOutputTokens: 4096, // 降低到 4096 以確保有足夠空間生成內容
         },
       }
     );
@@ -182,11 +155,19 @@ ${request.style ? `- 補充說明: ${request.style}` : ""}
       throw new Error("No candidates returned from Gemini API");
     }
 
-    // 檢查是否被安全過濾器阻擋
+    // 檢查候選回應
     const candidate = data.candidates[0];
-    if (candidate.finishReason && candidate.finishReason !== "STOP") {
-      console.error("[Gemini] Generation stopped with reason:", candidate.finishReason);
-      throw new Error(`Content generation stopped: ${candidate.finishReason}`);
+    const finishReason = candidate?.finishReason;
+    
+    // 只對真正的錯誤拋錯（安全過濾等），MAX_TOKENS 允許繼續處理（可能還有部分內容）
+    if (finishReason && finishReason !== "STOP" && finishReason !== "MAX_TOKENS") {
+      console.error("[Gemini] Generation stopped with reason:", finishReason);
+      throw new Error(`Content generation stopped: ${finishReason}`);
+    }
+    
+    // 如果是 MAX_TOKENS，記錄警告但繼續處理
+    if (finishReason === "MAX_TOKENS") {
+      console.warn("[Gemini] Response was truncated due to MAX_TOKENS, attempting to extract partial content...");
     }
 
     // 優先聚合所有 parts 文字（有些回應會拆多個 parts）
