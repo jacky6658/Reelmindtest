@@ -4,8 +4,8 @@ import axios from "axios";
 import { AXIOS_TIMEOUT_MS } from "@shared/const";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-// 使用更穩定的 gemini-1.5-flash（比 2.5-flash 更穩定，避免 503 錯誤）
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent";
+// 使用 v1 穩定版：1.5 系列需加 -latest 後綴
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent";
 
 // —— 輕量 RAG：載入知識庫、分塊與檢索 ——
 let knowledgeBaseFull: string = "";
@@ -286,24 +286,24 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
       const response = await withSemaphore(() =>
         axiosInstance.post(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.7,
-            topK: 40,
-            topP: 0.95,
+        generationConfig: {
+          temperature: 0.7,
+          topK: 40,
+          topP: 0.95,
             maxOutputTokens: maxTokens,
           },
         })
       );
 
       const data = response.data;
-      
-      // 檢查是否有候選回應
-      if (!data.candidates || data.candidates.length === 0) {
+    
+    // 檢查是否有候選回應
+    if (!data.candidates || data.candidates.length === 0) {
         console.warn(`[Gemini] ${segmentName}: No candidates, returning placeholder`);
         return `[${segmentName}] 生成失敗，請稍後再試。`;
-      }
+    }
 
-      const candidate = data.candidates[0];
+    const candidate = data.candidates[0];
       const finishReason = candidate?.finishReason;
       
       // 允許 MAX_TOKENS（可能還有部分內容）
