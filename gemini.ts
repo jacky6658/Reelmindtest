@@ -321,7 +321,7 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
         ? `[${segmentName}] 內容達到長度限制，請稍後再試。`
         : `[${segmentName}] 生成失敗，請稍後再試。`;
     } catch (error: any) {
-      // 記錄詳細錯誤資訊（包含重試次數）
+      // 記錄錯誤（但不拋出，返回佔位內容）
       const retryCount = error.config?.__retryCount || 0;
       const errorCode = error.response?.status || error.code;
       const errorMessage = error.response?.data?.error?.message || error.message || '';
@@ -329,36 +329,37 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
       if (retryCount > 0) {
         console.error(`[Gemini] ${segmentName} error after ${retryCount} retries:`, {
           code: errorCode,
-          message: errorMessage,
+          message: errorMessage.substring(0, 100),
           status: error.response?.status,
         });
       } else {
         console.error(`[Gemini] ${segmentName} error:`, {
           code: errorCode,
-          message: errorMessage,
+          message: errorMessage.substring(0, 100),
           status: error.response?.status,
         });
       }
       
-      // 根據錯誤類型回傳友善的錯誤訊息
+      // 永遠不拋錯，返回友善的佔位內容
       if (errorCode === 503 || errorMessage.includes('overloaded')) {
-        throw new Error("Gemini 模型目前過載，請稍後再試。如果問題持續，可能是 Google API 服務暫時不可用。");
+        return `${segmentName === "Positioning" ? "帳號定位" : segmentName === "Topics" ? "選題建議" : "腳本範例"}：系統目前較為忙碌，請稍後再試。`;
       }
       
       if (errorCode === 429) {
-        throw new Error("請求過於頻繁，請稍後再試。");
+        return `${segmentName === "Positioning" ? "帳號定位" : segmentName === "Topics" ? "選題建議" : "腳本範例"}：請求過於頻繁，請稍後再試。`;
       }
       
       // 網路錯誤
       if (error.code === 'EAI_AGAIN' || error.code === 'ENOTFOUND') {
-        throw new Error("無法連接到 Gemini API，請檢查網絡連接或稍後再試。");
+        return `${segmentName === "Positioning" ? "帳號定位" : segmentName === "Topics" ? "選題建議" : "腳本範例"}：網絡連接問題，請稍後再試。`;
       }
       
       if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
-        throw new Error("請求超時，請稍後再試。");
+        return `${segmentName === "Positioning" ? "帳號定位" : segmentName === "Topics" ? "選題建議" : "腳本範例"}：請求超時，請稍後再試。`;
       }
       
-      throw new Error(`${segmentName} 生成失敗: ${errorMessage || '請稍後再試'}`);
+      // 其他錯誤都返回友善訊息
+      return `${segmentName === "Positioning" ? "帳號定位" : segmentName === "Topics" ? "選題建議" : "腳本範例"}：生成過程中遇到問題，請稍後再試。`;
     }
   }
 
@@ -400,65 +401,44 @@ ${scriptContext || "（無相關知識庫內容）"}
 
 請針對「${request.topic}」的主題、「${request.targetAudience}」的受眾、「${request.goal}」的目標、「${request.platform}」的平台特性${request.style ? `、「${request.style}」的風格要求` : ""}，包含：主題標題、Hook、Value、CTA、畫面感、發佈文案。`;
 
+  // 方案B：三段並行生成（但受併發限制控制）
+  // 使用 try-catch 包裹每個段，確保永遠不拋錯
+  console.log("[Gemini] Starting 3-segment generation (positioning, topics, script)...");
+  
+  // 每個段都單獨 catch，確保不會因為一個失敗而影響其他
+  let positioning: string;
+  let topics: string;
+  let script: string;
+  
   try {
-    // 方案B：三段並行生成（但受併發限制控制）
-    console.log("[Gemini] Starting 3-segment generation (positioning, topics, script)...");
-    
-    const [positioning, topics, script] = await Promise.allSettled([
-      generateSegment(positioningPrompt, 1200, "Positioning"),
-      generateSegment(topicsPrompt, 1500, "Topics"),
-      generateSegment(scriptPrompt, 2000, "Script"),
-    ]);
-
-    // 處理結果（即使部分失敗也能回傳其他成功的部分）
-    const result = {
-      positioning: positioning.status === 'fulfilled' ? positioning.value : "生成失敗，請稍後再試",
-      topics: topics.status === 'fulfilled' ? topics.value : "生成失敗，請稍後再試",
-      script: script.status === 'fulfilled' ? script.value : "生成失敗，請稍後再試",
-    };
-
-    console.log(`[Gemini] Generation completed - P:${result.positioning.length}, T:${result.topics.length}, S:${result.script.length} chars`);
-
-    // 如果所有段都失敗，才拋錯
-    if (positioning.status === 'rejected' && topics.status === 'rejected' && script.status === 'rejected') {
-      const firstError = positioning.reason || topics.reason || script.reason;
-      throw firstError;
-    }
-
-    return result;
+    positioning = await generateSegment(positioningPrompt, 1200, "Positioning");
   } catch (error: any) {
-    console.error("[Gemini] Generation error:", error);
-    
-    // 提供更友好的錯誤訊息
-    const errorCode = error.response?.status || error.code;
-    const errorMessage = error.response?.data?.error?.message || error.message || '未知錯誤';
-    
-    // 處理 503 錯誤（已重試 3 次後仍失敗）
-    if (errorCode === 503 || errorMessage.includes('overloaded')) {
-      throw new Error("Gemini 模型目前過載，已重試多次仍失敗，請稍後再試。");
-    }
-    
-    // 處理 429 錯誤
-    if (errorCode === 429) {
-      throw new Error("請求過於頻繁，請稍後再試。");
-    }
-    
-    // 處理網絡錯誤
-    if (errorCode === 'EAI_AGAIN' || errorCode === 'ENOTFOUND') {
-      throw new Error("無法連接到 Gemini API，請檢查網絡連接。");
-    }
-    
-    if (errorCode === 'ETIMEDOUT' || errorCode === 'ECONNABORTED') {
-      throw new Error("請求超時，請稍後再試。");
-    }
-    
-    if (errorCode === 'ECONNRESET') {
-      throw new Error("連接被重置，請稍後再試。");
-    }
-    
-    // 其他錯誤
-    throw new Error(`生成內容失敗: ${errorMessage}`);
+    console.error("[Gemini] Positioning segment error (fallback):", error.message?.substring(0, 50));
+    positioning = "帳號定位：生成過程中遇到問題，請稍後再試。";
   }
+  
+  try {
+    topics = await generateSegment(topicsPrompt, 1500, "Topics");
+  } catch (error: any) {
+    console.error("[Gemini] Topics segment error (fallback):", error.message?.substring(0, 50));
+    topics = "選題建議：生成過程中遇到問題，請稍後再試。";
+  }
+  
+  try {
+    script = await generateSegment(scriptPrompt, 2000, "Script");
+  } catch (error: any) {
+    console.error("[Gemini] Script segment error (fallback):", error.message?.substring(0, 50));
+    script = "腳本範例：生成過程中遇到問題，請稍後再試。";
+  }
+
+  console.log(`[Gemini] Generation completed - P:${positioning.length}, T:${topics.length}, S:${script.length} chars`);
+
+  // 永遠返回結果，不拋錯
+  return {
+    positioning: positioning || "帳號定位：生成失敗，請稍後再試。",
+    topics: topics || "選題建議：生成失敗，請稍後再試。",
+    script: script || "腳本範例：生成失敗，請稍後再試。",
+  };
 }
 
 /**
