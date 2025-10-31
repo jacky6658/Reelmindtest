@@ -1,24 +1,136 @@
-import { readFileSync } from "fs";
-import { join } from "path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import axios from "axios";
 import { AXIOS_TIMEOUT_MS } from "@shared/const";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
 
-// 載入知識庫（只載入前 200 行以減少 token 消耗）
-let knowledgeBase: string = "";
+// —— 輕量 RAG：載入知識庫、分塊與檢索 ——
+let knowledgeBaseFull: string = "";
 try {
-  const fullContent = readFileSync(join(process.cwd(), "kb.txt"), "utf-8");
-  // 只取前 200 行，大約能減少 50% 的 token 消耗
-  const lines = fullContent.split("\n");
-  knowledgeBase = lines.slice(0, 200).join("\n");
-  if (lines.length > 200) {
-    console.log(`[Gemini] Knowledge base truncated from ${lines.length} to 200 lines to save tokens`);
-  }
+  knowledgeBaseFull = readFileSync(join(process.cwd(), "kb.txt"), "utf-8");
 } catch (error) {
   console.error("[Gemini] Failed to load knowledge base:", error);
 }
+
+type KBChunk = { text: string; termFreq: Map<string, number>; section: string };
+const kbChunks: KBChunk[] = [];
+const idfMap: Map<string, number> = new Map();
+
+// 定義各產出對應的知識庫章節
+const SECTION_MAPPING = {
+  positioning: ["一、流量/轉換邏輯（總綱）"],
+  topics: ["二、熱門話題類型（選題方向）"],
+  script: ["三、標題與開場鉤子（Hook）", "四、常用腳本結構（按目標選）", "六、CTA 模板（按目標切）", "八、平台備註（簡表）"],
+};
+
+function tokenize(input: string): string[] {
+  // 以字母/數字/常見中日韓漢字為主的簡單 tokenizer；全部轉小寫
+  const lowered = input.toLowerCase();
+  const tokens = lowered
+    .split(/[^a-z0-9\u4e00-\u9fff]+/i)
+    .filter(t => t.length > 1);
+  return tokens;
+}
+
+function buildKbIndex() {
+  if (!knowledgeBaseFull) return;
+  const lines = knowledgeBaseFull.split("\n");
+  const chunkSize = 12;
+  
+  // 識別當前章節
+  let currentSection = "";
+  
+  for (let i = 0; i < lines.length; i += chunkSize) {
+    const slice = lines.slice(i, i + chunkSize).join("\n").trim();
+    if (!slice) continue;
+    
+    // 檢查 slice 中是否包含章節標題行
+    for (const line of slice.split("\n")) {
+      // 匹配格式：一、流量/轉換邏輯（總綱） 或 一、文案腳本與流量技巧
+      const titleMatch = line.match(/([一二三四五六七八九十]、[^/\n]+)/);
+      if (titleMatch) {
+        currentSection = titleMatch[1].trim();
+        break;
+      }
+    }
+    
+    const tf = new Map<string, number>();
+    for (const tok of tokenize(slice)) {
+      tf.set(tok, (tf.get(tok) ?? 0) + 1);
+    }
+    kbChunks.push({ text: slice, termFreq: tf, section: currentSection || "" });
+  }
+
+  // 計算簡易 IDF
+  const docCount = kbChunks.length || 1;
+  const vocab = new Map<string, number>();
+  for (const chunk of kbChunks) {
+    const seen = new Set<string>();
+    for (const term of Array.from(chunk.termFreq.keys())) {
+      if (seen.has(term)) continue;
+      seen.add(term);
+      vocab.set(term, (vocab.get(term) ?? 0) + 1);
+    }
+  }
+  for (const [term, df] of Array.from(vocab.entries())) {
+    const idf = Math.log((1 + docCount) / (1 + df)) + 1; // smoothed idf
+    idfMap.set(term, idf);
+  }
+}
+
+function scoreChunk(queryTf: Map<string, number>, chunk: KBChunk): number {
+  // cosine on tf-idf
+  let dot = 0;
+  let qNorm = 0;
+  let cNorm = 0;
+  for (const [term, qtf] of Array.from(queryTf.entries())) {
+    const idf = idfMap.get(term) ?? 1;
+    const q = qtf * idf;
+    qNorm += q * q;
+    const ctf = chunk.termFreq.get(term) ?? 0;
+    if (ctf > 0) dot += q * (ctf * idf);
+  }
+  for (const [term, ctf] of Array.from(chunk.termFreq.entries())) {
+    const idf = idfMap.get(term) ?? 1;
+    const v = ctf * idf;
+    cNorm += v * v;
+  }
+  if (qNorm === 0 || cNorm === 0) return 0;
+  return dot / (Math.sqrt(qNorm) * Math.sqrt(cNorm));
+}
+
+function retrieveContext(query: string, outputType: "positioning" | "topics" | "script" = "script", topK = 5): string {
+  if (kbChunks.length === 0) return "";
+  
+  // 根據產出類型篩選對應章節
+  const targetSections = SECTION_MAPPING[outputType];
+  const filteredChunks = kbChunks.filter(chunk => {
+    // 檢查 chunk 的 section 是否匹配目標章節（匹配章節編號：一、二、三、四、六、八）
+    return targetSections.some(section => {
+      const sectionNum = section.split("、")[0]; // 提取「一」「二」「三」等
+      return chunk.section.startsWith(sectionNum);
+    });
+  });
+  
+  if (filteredChunks.length === 0) return "";
+  
+  const tf = new Map<string, number>();
+  for (const tok of tokenize(query)) {
+    tf.set(tok, (tf.get(tok) ?? 0) + 1);
+  }
+  
+  const scored = filteredChunks
+    .map(ch => ({ ch, s: scoreChunk(tf, ch) }))
+    .sort((a, b) => b.s - a.s)
+    .slice(0, topK)
+    .map(x => x.ch.text);
+  
+  return scored.join("\n\n");
+}
+
+buildKbIndex();
 
 interface GenerateRequest {
   topic: string;
@@ -48,10 +160,20 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
     throw new Error("GEMINI_API_KEY is not configured");
   }
 
-  const prompt = `你是短影音顧問。請用自然口語回覆，避免程式碼與任何 Markdown 符號；可少量使用 emoji。
+  const userQuery = [
+    request.topic,
+    request.targetAudience,
+    request.goal,
+    request.platform,
+    request.style ?? "",
+  ].filter(Boolean).join(" \n ");
 
-知識庫（節選）:
-${knowledgeBase}
+  // 為三個部分分別檢索對應的知識庫內容
+  const positioningContext = retrieveContext(userQuery, "positioning", 3);
+  const topicsContext = retrieveContext(userQuery, "topics", 3);
+  const scriptContext = retrieveContext(userQuery, "script", 5);
+
+  const prompt = `你是短影音顧問。請用自然口語回覆，避免程式碼與任何 Markdown 符號；可少量使用 emoji。
 
 使用者輸入：
 - 主題: ${request.topic}
@@ -63,7 +185,8 @@ ${request.style ? `- 補充: ${request.style}` : ""}
 請嚴格依下列格式輸出三段內容（使用 === 作為分隔）。句子短、逐段換行；列點用 - 或 •；避免口頭禪。
 
 ===POSITIONING_START===
-[帳號定位內容]
+[帳號定位內容]（請參考以下知識庫內容）
+${positioningContext || "（無相關知識庫內容）"}
 - 受眾洞察
 - 定位建議
 - 風格調性
@@ -72,12 +195,14 @@ ${request.style ? `- 補充: ${request.style}` : ""}
 ===POSITIONING_END===
 
 ===TOPICS_START===
-[選題建議]
+[選題建議]（請參考以下知識庫內容）
+${topicsContext || "（無相關知識庫內容）"}
 提供 3-5 個選題；每個包含：標題、具體建議、策略/技巧、內容規劃、時程建議。
 ===TOPICS_END===
 
 ===SCRIPT_START===
-[完整的30秒腳本範例]
+[完整的30秒腳本範例]（請參考以下知識庫內容）
+${scriptContext || "（無相關知識庫內容）"}
 包含：主題標題、Hook、Value、CTA、畫面感、發佈文案。
 ===SCRIPT_END===
 
@@ -99,24 +224,38 @@ ${request.style ? `- 補充: ${request.style}` : ""}
       async (error) => {
         const config = error.config;
         
-        // 如果是網絡錯誤（DNS、連接等），進行重試
-        if (
+        // 檢查是否應該重試（503、429、網絡錯誤等）
+        const shouldRetry = 
           !config?.__retryCount &&
-          (error.code === 'EAI_AGAIN' ||
-           error.code === 'ENOTFOUND' ||
-           error.code === 'ETIMEDOUT' ||
-           error.code === 'ECONNRESET' ||
-           error.message?.includes('getaddrinfo') ||
-           error.message?.includes('timeout') ||
-           (error.cause && (error.cause.code === 'EAI_AGAIN' || error.cause.code === 'ENOTFOUND')))
-        ) {
+          (
+            // HTTP 錯誤碼：503（服務不可用/過載）、429（請求過多）、500（伺服器錯誤）
+            (error.response?.status === 503 || 
+             error.response?.status === 429 || 
+             error.response?.status === 500) ||
+            // 網絡錯誤（DNS、連接等）
+            error.code === 'EAI_AGAIN' ||
+            error.code === 'ENOTFOUND' ||
+            error.code === 'ETIMEDOUT' ||
+            error.code === 'ECONNRESET' ||
+            error.message?.includes('getaddrinfo') ||
+            error.message?.includes('timeout') ||
+            (error.cause && (error.cause.code === 'EAI_AGAIN' || error.cause.code === 'ENOTFOUND'))
+          );
+        
+        if (shouldRetry) {
           config.__retryCount = config.__retryCount || 0;
           config.__retryCount += 1;
           
           if (config.__retryCount <= 3) {
-            const delay = 1000 * config.__retryCount; // 指數退避
-            console.warn(`[Gemini] Network error, retrying (${config.__retryCount}/3) after ${delay}ms...`, error.message);
-            await new Promise(resolve => setTimeout(resolve, delay));
+            // 對於 503/429，使用更長的延遲（指數退避 + 額外延遲）
+            const baseDelay = error.response?.status === 503 || error.response?.status === 429 
+              ? 2000 * config.__retryCount // 2秒、4秒、6秒
+              : 1000 * config.__retryCount; // 1秒、2秒、3秒
+            console.warn(
+              `[Gemini] ${error.response?.status ? `HTTP ${error.response.status}` : 'Network'} error, retrying (${config.__retryCount}/3) after ${baseDelay}ms...`, 
+              error.response?.data?.error?.message || error.message
+            );
+            await new Promise(resolve => setTimeout(resolve, baseDelay));
             return axiosInstance(config);
           }
         }
@@ -233,7 +372,20 @@ ${request.style ? `- 補充: ${request.style}` : ""}
     if (error.response) {
       const status = error.response.status;
       const statusText = error.response.statusText || '';
-      throw new Error(`Gemini API 錯誤 (${status} ${statusText}): ${errorMessage || '請稍後再試'}`);
+      const apiError = error.response.data?.error;
+      
+      // 特別處理 503 錯誤（模型過載）
+      if (status === 503) {
+        throw new Error("Gemini 模型目前過載，請稍後再試。如果問題持續，可能是 Google API 服務暫時不可用。");
+      }
+      
+      // 處理 429 錯誤（請求過多）
+      if (status === 429) {
+        throw new Error("請求過於頻繁，請稍後再試。");
+      }
+      
+      // 處理其他 HTTP 錯誤
+      throw new Error(`Gemini API 錯誤 (${status} ${statusText}): ${apiError?.message || errorMessage || '請稍後再試'}`);
     }
     
     // 處理其他網絡錯誤
