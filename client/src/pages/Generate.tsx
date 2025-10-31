@@ -72,7 +72,7 @@ export default function Generate() {
                 >
                   {num}
                 </div>
-                <span className="mt-2 text-sm font-medium text-blue-700">
+                <span className="mt-2 text-xs font-medium text-blue-700 whitespace-nowrap">
                   {label}
                 </span>
               </div>
@@ -171,7 +171,7 @@ export default function Generate() {
                       key={platform}
                       type="button"
                       onClick={() => setFormData({ ...formData, platform })}
-                      className={`p-3 rounded-lg border-2 text-center transition-all ${
+                      className={`p-3 rounded-lg border-2 text-center transition-all flex items-center justify-center text-sm leading-tight ${
                         formData.platform === platform
                           ? "border-blue-600 bg-blue-50 text-blue-700 font-medium"
                           : "border-gray-200 bg-white text-gray-600 hover:border-blue-300"
