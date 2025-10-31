@@ -132,6 +132,13 @@ function retrieveContext(query: string, outputType: "positioning" | "topics" | "
 
 buildKbIndex();
 
+// 將文字截斷到指定長度（以避免 prompt 過長）
+function trimContext(text: string, maxChars: number): string {
+  if (!text) return "";
+  if (text.length <= maxChars) return text;
+  return text.slice(0, Math.max(0, maxChars - 20)) + "\n...（後略）";
+}
+
 interface GenerateRequest {
   topic: string;
   targetAudience: string;
@@ -168,189 +175,200 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
     request.style ?? "",
   ].filter(Boolean).join(" \n ");
 
-  // 為三個部分分別檢索對應的知識庫內容
-  const positioningContext = retrieveContext(userQuery, "positioning", 3);
-  const topicsContext = retrieveContext(userQuery, "topics", 3);
-  const scriptContext = retrieveContext(userQuery, "script", 5);
+  // —— 方案B：併發限制（避免多人同時使用時觸發 503）——
+  const MAX_CONCURRENT = 3;
+  let active = (globalThis as any).__gemini_active__ || 0;
+  const setActive = (v: number) => ((globalThis as any).__gemini_active__ = v);
   
-  // 調試：記錄檢索結果長度
-  console.log(`[Gemini] RAG Context lengths - Positioning: ${positioningContext.length}, Topics: ${topicsContext.length}, Script: ${scriptContext.length}`);
+  async function withSemaphore<T>(fn: () => Promise<T>): Promise<T> {
+    while (active >= MAX_CONCURRENT) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    active += 1;
+    setActive(active);
+    try {
+      return await fn();
+    } finally {
+      active -= 1;
+      setActive(active);
+    }
+  }
 
-  const prompt = `你是短影音顧問。請用自然口語回覆，避免程式碼與任何 Markdown 符號；可少量使用 emoji。
+  // 配置 axios 實例（統一的重試與錯誤處理）
+  const axiosInstance = axios.create({
+    timeout: AXIOS_TIMEOUT_MS,
+    headers: { "Content-Type": "application/json" },
+  });
 
-使用者輸入：
-- 主題: ${request.topic}
-- 受眾: ${request.targetAudience}
-- 目標: ${request.goal}
-- 平台: ${request.platform}
-${request.style ? `- 補充: ${request.style}` : ""}
+  axiosInstance.interceptors.response.use(
+    (response) => response,
+    async (error) => {
+      const config = error.config;
+      const shouldRetry = 
+        !config?.__retryCount &&
+        (
+          (error.response?.status === 503 || 
+           error.response?.status === 429 || 
+           error.response?.status === 500) ||
+          error.code === 'EAI_AGAIN' ||
+          error.code === 'ENOTFOUND' ||
+          error.code === 'ETIMEDOUT' ||
+          error.code === 'ECONNRESET' ||
+          error.message?.includes('getaddrinfo') ||
+          error.message?.includes('timeout') ||
+          (error.cause && (error.cause.code === 'EAI_AGAIN' || error.cause.code === 'ENOTFOUND'))
+        );
+      
+      if (shouldRetry) {
+        config.__retryCount = config.__retryCount || 0;
+        config.__retryCount += 1;
+        
+        if (config.__retryCount <= 3) {
+          const baseDelay = error.response?.status === 503 || error.response?.status === 429 
+            ? 2000 * config.__retryCount
+            : 1000 * config.__retryCount;
+          console.warn(
+            `[Gemini] ${error.response?.status ? `HTTP ${error.response.status}` : 'Network'} error, retrying (${config.__retryCount}/3) after ${baseDelay}ms...`, 
+            error.response?.data?.error?.message || error.message
+          );
+          await new Promise(resolve => setTimeout(resolve, baseDelay));
+          return axiosInstance(config);
+        }
+      }
+      
+      return Promise.reject(error);
+    }
+  );
 
-請嚴格依下列格式輸出三段內容（使用 === 作為分隔）。句子短、逐段換行；列點用 - 或 •；避免口頭禪。
+  // 單段生成函數（帶併發限制）
+  async function generateSegment(
+    prompt: string, 
+    maxTokens: number, 
+    segmentName: string
+  ): Promise<string> {
+    try {
+      const response = await withSemaphore(() =>
+        axiosInstance.post(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: maxTokens,
+          },
+        })
+      );
 
-===POSITIONING_START===
-[帳號定位內容]（請參考以下知識庫內容）
+      const data = response.data;
+      
+      // 檢查是否有候選回應
+      if (!data.candidates || data.candidates.length === 0) {
+        console.warn(`[Gemini] ${segmentName}: No candidates, returning placeholder`);
+        return `[${segmentName}] 生成失敗，請稍後再試。`;
+      }
+
+      const candidate = data.candidates[0];
+      const finishReason = candidate?.finishReason;
+      
+      // 允許 MAX_TOKENS（可能還有部分內容）
+      if (finishReason && finishReason !== "STOP" && finishReason !== "MAX_TOKENS") {
+        console.warn(`[Gemini] ${segmentName}: Stopped with reason ${finishReason}`);
+      }
+
+      // 提取文字內容
+      const parts = candidate?.content?.parts;
+      if (Array.isArray(parts) && parts.length > 0) {
+        const text = parts
+          .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+          .filter(Boolean)
+          .join("\n")
+          .trim();
+        
+        if (text) {
+          console.log(`[Gemini] ${segmentName}: Generated ${text.length} chars`);
+          return text;
+        }
+      }
+
+      // 如果沒有內容，返回占位訊息
+      console.warn(`[Gemini] ${segmentName}: No text content, returning placeholder`);
+      return finishReason === "MAX_TOKENS" 
+        ? `[${segmentName}] 內容達到長度限制，請稍後再試。`
+        : `[${segmentName}] 生成失敗，請稍後再試。`;
+    } catch (error: any) {
+      console.error(`[Gemini] ${segmentName} error:`, error);
+      
+      const cause = error.cause || {};
+      const errorCode = error.code || cause.code || error.response?.status;
+      const errorMessage = error.message || cause.message || error.response?.data?.error?.message || '';
+      
+      if (errorCode === 503 || errorMessage.includes('overloaded')) {
+        throw new Error("Gemini 模型目前過載，請稍後再試。");
+      }
+      
+      if (errorCode === 429) {
+        throw new Error("請求過於頻繁，請稍後再試。");
+      }
+      
+      throw new Error(`${segmentName} 生成失敗: ${errorMessage || '請稍後再試'}`);
+    }
+  }
+
+  // RAG：為三段分別檢索知識庫內容
+  const positioningContext = trimContext(retrieveContext(userQuery, "positioning", 3), 800);
+  const topicsContext = trimContext(retrieveContext(userQuery, "topics", 3), 900);
+  const scriptContext = trimContext(retrieveContext(userQuery, "script", 5), 1400);
+  
+  console.log(`[Gemini] RAG Context - P:${positioningContext.length}, T:${topicsContext.length}, S:${scriptContext.length}`);
+
+  // 使用者輸入資訊（每段都會使用）
+  const userInput = `使用者需求：
+- 主題/產品：${request.topic}
+- 目標受眾：${request.targetAudience}
+- 影片目標：${request.goal}
+- 社群平台：${request.platform}${request.style ? `\n- 補充說明：${request.style}` : ""}`;
+
+  const formatGuide = `\n\n語氣與格式要求：口語自然、短句換行；可少量使用 emoji；禁止任何 Markdown 標記（**、#、##）。`;
+
+  // 三段獨立的 prompt（每段都明確包含使用者需求與對應知識庫）
+  const positioningPrompt = `${userInput}${formatGuide}
+
+請根據以上使用者需求，結合以下知識庫內容，輸出「帳號定位內容」：
 ${positioningContext || "（無相關知識庫內容）"}
-- 受眾洞察
-- 定位建議
-- 風格調性
-- 競爭優勢
-- 具體行動建議
-===POSITIONING_END===
 
-===TOPICS_START===
-[選題建議]（請參考以下知識庫內容）
+請直接輸出定位內容，必須針對「${request.topic}」的主題、「${request.targetAudience}」的受眾、「${request.goal}」的目標，包含：受眾洞察、定位建議、風格調性、競爭優勢、具體行動建議。`;
+  
+  const topicsPrompt = `${userInput}${formatGuide}
+
+請根據以上使用者需求，結合以下知識庫內容，輸出 3–5 個「選題建議」：
 ${topicsContext || "（無相關知識庫內容）"}
-提供 3-5 個選題；每個包含：標題、具體建議、策略/技巧、內容規劃、時程建議。
-===TOPICS_END===
 
-===SCRIPT_START===
-[完整的30秒腳本範例]（請參考以下知識庫內容）
+請針對「${request.topic}」的主題、「${request.goal}」的目標、「${request.platform}」的平台特性，每個選題包含：標題、具體建議、策略/技巧、內容規劃、時程建議。`;
+  
+  const scriptPrompt = `${userInput}${formatGuide}
+
+請根據以上使用者需求，結合以下知識庫內容，輸出「完整的 30 秒腳本範例」：
 ${scriptContext || "（無相關知識庫內容）"}
-包含：主題標題、Hook、Value、CTA、畫面感、發佈文案。
-===SCRIPT_END===
 
-直接開始輸出 ===POSITIONING_START===。`;
+請針對「${request.topic}」的主題、「${request.targetAudience}」的受眾、「${request.goal}」的目標、「${request.platform}」的平台特性${request.style ? `、「${request.style}」的風格要求` : ""}，包含：主題標題、Hook、Value、CTA、畫面感、發佈文案。`;
 
   try {
-    // 使用 axios 代替 fetch，提供更好的錯誤處理和重試機制
-    // 配置 axios 實例，設置超時和重試
-    const axiosInstance = axios.create({
-      timeout: AXIOS_TIMEOUT_MS,
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
-
-    // 添加響應攔截器來處理錯誤
-    axiosInstance.interceptors.response.use(
-      (response) => response,
-      async (error) => {
-        const config = error.config;
-        
-        // 檢查是否應該重試（503、429、網絡錯誤等）
-        const shouldRetry = 
-          !config?.__retryCount &&
-          (
-            // HTTP 錯誤碼：503（服務不可用/過載）、429（請求過多）、500（伺服器錯誤）
-            (error.response?.status === 503 || 
-             error.response?.status === 429 || 
-             error.response?.status === 500) ||
-            // 網絡錯誤（DNS、連接等）
-            error.code === 'EAI_AGAIN' ||
-            error.code === 'ENOTFOUND' ||
-            error.code === 'ETIMEDOUT' ||
-            error.code === 'ECONNRESET' ||
-            error.message?.includes('getaddrinfo') ||
-            error.message?.includes('timeout') ||
-            (error.cause && (error.cause.code === 'EAI_AGAIN' || error.cause.code === 'ENOTFOUND'))
-          );
-        
-        if (shouldRetry) {
-          config.__retryCount = config.__retryCount || 0;
-          config.__retryCount += 1;
-          
-          if (config.__retryCount <= 3) {
-            // 對於 503/429，使用更長的延遲（指數退避 + 額外延遲）
-            const baseDelay = error.response?.status === 503 || error.response?.status === 429 
-              ? 2000 * config.__retryCount // 2秒、4秒、6秒
-              : 1000 * config.__retryCount; // 1秒、2秒、3秒
-            console.warn(
-              `[Gemini] ${error.response?.status ? `HTTP ${error.response.status}` : 'Network'} error, retrying (${config.__retryCount}/3) after ${baseDelay}ms...`, 
-              error.response?.data?.error?.message || error.message
-            );
-            await new Promise(resolve => setTimeout(resolve, baseDelay));
-            return axiosInstance(config);
-          }
-        }
-        
-        return Promise.reject(error);
-      }
-    );
-
-    const response = await axiosInstance.post(
-      `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`,
-      {
-        contents: [
-          {
-            parts: [
-              {
-                text: prompt,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0.7,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 4096, // 降低到 4096 以確保有足夠空間生成內容
-        },
-      }
-    );
-
-    const data = response.data;
-    console.log("[Gemini] API response:", JSON.stringify(data, null, 2));
+    // 方案B：三段並行生成（但受併發限制控制）
+    console.log("[Gemini] Starting 3-segment generation (positioning, topics, script)...");
     
-    // 檢查是否有候選回應
-    if (!data.candidates || data.candidates.length === 0) {
-      console.error("[Gemini] No candidates in response. Full response:", JSON.stringify(data, null, 2));
-      throw new Error("No candidates returned from Gemini API");
-    }
+    const [positioning, topics, script] = await Promise.all([
+      generateSegment(positioningPrompt, 1200, "Positioning"),
+      generateSegment(topicsPrompt, 1500, "Topics"),
+      generateSegment(scriptPrompt, 2000, "Script"),
+    ]);
 
-    // 檢查候選回應
-    const candidate = data.candidates[0];
-    const finishReason = candidate?.finishReason;
-    
-    // 只對真正的錯誤拋錯（安全過濾等），MAX_TOKENS 允許繼續處理（可能還有部分內容）
-    if (finishReason && finishReason !== "STOP" && finishReason !== "MAX_TOKENS") {
-      console.error("[Gemini] Generation stopped with reason:", finishReason);
-      throw new Error(`Content generation stopped: ${finishReason}`);
-    }
-    
-    // 如果是 MAX_TOKENS，記錄警告但繼續處理
-    if (finishReason === "MAX_TOKENS") {
-      console.warn("[Gemini] Response was truncated due to MAX_TOKENS, attempting to extract partial content...");
-    }
+    console.log(`[Gemini] All segments generated - P:${positioning.length}, T:${topics.length}, S:${script.length} chars`);
 
-    // 優先聚合所有 parts 文字（有些回應會拆多個 parts）
-    let generatedText = "";
-    const parts = candidate?.content?.parts;
-    if (Array.isArray(parts) && parts.length > 0) {
-      generatedText = parts
-        .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
-        .filter(Boolean)
-        .join("\n")
-        .trim();
-    }
-
-    // 若沒有 parts 或文字，嘗試從所有 candidates 聚合文字
-    if (!generatedText && Array.isArray(data.candidates)) {
-      generatedText = data.candidates
-        .flatMap((c: any) => (Array.isArray(c?.content?.parts) ? c.content.parts : []))
-        .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
-        .filter(Boolean)
-        .join("\n")
-        .trim();
-    }
-
-    // 若仍無文字，且為 MAX_TOKENS 或內容缺失，回傳可用的占位內容而非直接丟錯
-    if (!generatedText) {
-      console.warn("[Gemini] No text content parsed – finishReason:", finishReason, "content.parts:", candidate?.content?.parts);
-      console.warn("[Gemini] Returning partial placeholders instead of throwing error.");
-      const partialMessage =
-        finishReason === "MAX_TOKENS" 
-          ? "生成內容時達到長度限制，請稍後再試或減少輸入長度。"
-          : "內容生成失敗，請稍後再試。";
-      return {
-        positioning: partialMessage,
-        topics: partialMessage,
-        script: partialMessage,
-      };
-    }
-
-    // 解析生成的內容,分割成三個部分
-    const result = parseGeneratedContent(generatedText);
-    return result;
+    return {
+      positioning: positioning || "生成失敗，請重試",
+      topics: topics || "生成失敗，請重試",
+      script: script || "生成失敗，請重試",
+    };
   } catch (error: any) {
     console.error("[Gemini] Generation error:", error);
     
