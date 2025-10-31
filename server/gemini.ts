@@ -4,8 +4,8 @@ import axios from "axios";
 import { AXIOS_TIMEOUT_MS } from "@shared/const";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-// 使用 v1 API + gemini-2.5-flash（原始可用的配置，只是改回 v1）
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
+// 使用 v1 API + gemini-pro（最基礎、最通用的模型，應該所有專案都支援）
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent";
 
 // —— 輕量 RAG：載入知識庫、分塊與檢索 ——
 let knowledgeBaseFull: string = "";
@@ -296,14 +296,27 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
       );
 
       const data = response.data;
+      
+      // 詳細日誌：查看 API 回應結構
+      console.log(`[Gemini] ${segmentName} API response structure:`, JSON.stringify({
+        hasCandidates: !!data.candidates,
+        candidatesLength: data.candidates?.length || 0,
+        firstCandidate: data.candidates?.[0] ? {
+          finishReason: data.candidates[0].finishReason,
+          hasContent: !!data.candidates[0].content,
+          hasParts: !!data.candidates[0].content?.parts,
+          partsLength: data.candidates[0].content?.parts?.length || 0,
+          partsTypes: data.candidates[0].content?.parts?.map((p: any) => typeof p?.text) || [],
+        } : null,
+      }, null, 2));
     
-    // 檢查是否有候選回應
-    if (!data.candidates || data.candidates.length === 0) {
+      // 檢查是否有候選回應
+      if (!data.candidates || data.candidates.length === 0) {
         console.warn(`[Gemini] ${segmentName}: No candidates, returning placeholder`);
         return `[${segmentName}] 生成失敗，請稍後再試。`;
-    }
+      }
 
-    const candidate = data.candidates[0];
+      const candidate = data.candidates[0];
       const finishReason = candidate?.finishReason;
       
       // 允許 MAX_TOKENS（可能還有部分內容）
@@ -311,11 +324,16 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
         console.warn(`[Gemini] ${segmentName}: Stopped with reason ${finishReason}`);
       }
 
-      // 提取文字內容
+      // 提取文字內容（嘗試多種格式）
       const parts = candidate?.content?.parts;
       if (Array.isArray(parts) && parts.length > 0) {
         const text = parts
-          .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+          .map((p: any) => {
+            // 檢查不同的文字欄位
+            if (typeof p?.text === "string") return p.text;
+            if (typeof p?.text?.content === "string") return p.text.content;
+            return "";
+          })
           .filter(Boolean)
           .join("\n")
           .trim();
@@ -325,9 +343,17 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
           return text;
         }
       }
+      
+      // 如果 parts 是空的，嘗試直接從 candidate 提取
+      const directText = candidate?.content?.text || candidate?.text;
+      if (directText && typeof directText === "string") {
+        console.log(`[Gemini] ${segmentName}: Generated ${directText.length} chars (direct text)`);
+        return directText.trim();
+      }
 
       // 如果沒有內容，返回占位訊息
-      console.warn(`[Gemini] ${segmentName}: No text content, returning placeholder`);
+      console.warn(`[Gemini] ${segmentName}: No text content, returning placeholder. FinishReason: ${finishReason}`);
+      console.warn(`[Gemini] ${segmentName}: Full candidate structure:`, JSON.stringify(candidate, null, 2));
       return finishReason === "MAX_TOKENS" 
         ? `[${segmentName}] 內容達到長度限制，請稍後再試。`
         : `[${segmentName}] 生成失敗，請稍後再試。`;
