@@ -147,6 +147,11 @@ export default function Home() {
           </div>
         </div>
       </section>
+
+      {/* Footer */}
+      <footer className="py-6 text-center text-white/60 text-sm">
+        <p>Powered by AIJob學院</p>
+      </footer>
     </div>
   );
 }
