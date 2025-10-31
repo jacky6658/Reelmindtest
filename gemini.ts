@@ -172,6 +172,9 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
   const positioningContext = retrieveContext(userQuery, "positioning", 3);
   const topicsContext = retrieveContext(userQuery, "topics", 3);
   const scriptContext = retrieveContext(userQuery, "script", 5);
+  
+  // 調試：記錄檢索結果長度
+  console.log(`[Gemini] RAG Context lengths - Positioning: ${positioningContext.length}, Topics: ${topicsContext.length}, Script: ${scriptContext.length}`);
 
   const prompt = `你是短影音顧問。請用自然口語回覆，避免程式碼與任何 Markdown 符號；可少量使用 emoji。
 
@@ -332,9 +335,12 @@ ${scriptContext || "（無相關知識庫內容）"}
 
     // 若仍無文字，且為 MAX_TOKENS 或內容缺失，回傳可用的占位內容而非直接丟錯
     if (!generatedText) {
-      console.warn("[Gemini] No text content parsed – returning partial placeholders.");
+      console.warn("[Gemini] No text content parsed – finishReason:", finishReason, "content.parts:", candidate?.content?.parts);
+      console.warn("[Gemini] Returning partial placeholders instead of throwing error.");
       const partialMessage =
-        "內容被截斷或未成功返回，請減少輸入長度或稍後再試。";
+        finishReason === "MAX_TOKENS" 
+          ? "生成內容時達到長度限制，請稍後再試或減少輸入長度。"
+          : "內容生成失敗，請稍後再試。";
       return {
         positioning: partialMessage,
         topics: partialMessage,
