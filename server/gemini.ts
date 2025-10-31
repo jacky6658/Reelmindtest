@@ -4,7 +4,8 @@ import axios from "axios";
 import { AXIOS_TIMEOUT_MS } from "@shared/const";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
+// 使用更穩定的 gemini-1.5-flash（比 2.5-flash 更穩定，避免 503 錯誤）
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent";
 
 // —— 輕量 RAG：載入知識庫、分塊與檢索 ——
 let knowledgeBaseFull: string = "";
@@ -175,8 +176,9 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
     request.style ?? "",
   ].filter(Boolean).join(" \n ");
 
-  // —— 方案B：併發限制（避免多人同時使用時觸發 503）——
-  const MAX_CONCURRENT = 2; // 降低到 2，減少 503 發生率
+  // —— 併發限制（避免多人同時使用時觸發 503）——
+  // 注意：由於改為串行執行，這裡主要防止多個用戶同時請求
+  const MAX_CONCURRENT = 1; // 串行模式下，每個用戶的請求也是串行的，所以設為 1
   let active = (globalThis as any).__gemini_active__ || 0;
   const setActive = (v: number) => ((globalThis as any).__gemini_active__ = v);
   
@@ -235,21 +237,25 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
       // 取得當前重試次數（如果沒有則初始化）
       config.__retryCount = config.__retryCount || 0;
       
+      // 503/429 錯誤重試更多次（最多 6 次），其他錯誤 3 次
+      const maxRetries = (status === 503 || status === 429) ? 6 : 3;
+      
       // 如果未超過重試次數，則重試
-      if (config.__retryCount < 3) {
+      if (config.__retryCount < maxRetries) {
         config.__retryCount += 1;
         
         // 503/429 用更長的延遲（指數退避 + 隨機抖動）
+        // 對於 503，延遲更長：5秒、10秒、15秒、20秒、25秒、30秒
         const baseDelay = (status === 503 || status === 429) 
-          ? 3000 * config.__retryCount  // 3秒、6秒、9秒（增加延遲）
+          ? 5000 * config.__retryCount  // 5秒、10秒、15秒、20秒、25秒、30秒
           : 1500 * config.__retryCount; // 1.5秒、3秒、4.5秒
         // 加入隨機抖動（±20%），避免所有請求同時重試
         const jitter = baseDelay * 0.2 * (Math.random() * 2 - 1);
-        const delay = Math.max(1000, baseDelay + jitter);
+        const delay = Math.max(2000, baseDelay + jitter); // 最少 2 秒
         
         const errorMsg = error.response?.data?.error?.message || error.message || 'Unknown error';
         console.warn(
-          `[Gemini] ${status ? `HTTP ${status}` : `Network (${errorCode})`} error, retrying (${config.__retryCount}/3) after ${delay}ms...`,
+          `[Gemini] ${status ? `HTTP ${status}` : `Network (${errorCode})`} error, retrying (${config.__retryCount}/${maxRetries}) after ${Math.round(delay)}ms...`,
           errorMsg.substring(0, 100)
         );
         
@@ -406,17 +412,19 @@ ${scriptContext || "（無相關知識庫內容）"}
 
 請針對「${request.topic}」的主題、「${request.targetAudience}」的受眾、「${request.goal}」的目標、「${request.platform}」的平台特性${request.style ? `、「${request.style}」的風格要求` : ""}，包含：主題標題、Hook、Value、CTA、畫面感、發佈文案。`;
 
-  // 方案B：三段並行生成（但受併發限制控制）
-  // 使用 try-catch 包裹每個段，確保永遠不拋錯
-  console.log("[Gemini] Starting 3-segment generation (positioning, topics, script)...");
+  // 方案C：三段串行生成（避免同時發送多個請求觸發 rate limit）
+  // 串行執行可以避免觸發 Gemini API 的 rate limit
+  console.log("[Gemini] Starting 3-segment generation (positioning, topics, script) - sequential mode...");
   
-  // 每個段都單獨 catch，確保不會因為一個失敗而影響其他
   let positioning: string;
   let topics: string;
   let script: string;
   
+  // 串行執行：一個完成後再執行下一個
   try {
     positioning = await generateSegment(positioningPrompt, 1200, "Positioning");
+    console.log("[Gemini] Positioning completed, waiting 1s before next segment...");
+    await new Promise(resolve => setTimeout(resolve, 1000)); // 請求間延遲 1 秒
   } catch (error: any) {
     console.error("[Gemini] Positioning segment error (fallback):", error.message?.substring(0, 50));
     positioning = "帳號定位：生成過程中遇到問題，請稍後再試。";
@@ -424,6 +432,8 @@ ${scriptContext || "（無相關知識庫內容）"}
   
   try {
     topics = await generateSegment(topicsPrompt, 1500, "Topics");
+    console.log("[Gemini] Topics completed, waiting 1s before next segment...");
+    await new Promise(resolve => setTimeout(resolve, 1000)); // 請求間延遲 1 秒
   } catch (error: any) {
     console.error("[Gemini] Topics segment error (fallback):", error.message?.substring(0, 50));
     topics = "選題建議：生成過程中遇到問題，請稍後再試。";
