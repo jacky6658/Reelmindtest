@@ -2,7 +2,7 @@ import { readFileSync } from "fs";
 import { join } from "path";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
 
 // 載入知識庫
 let knowledgeBase: string = "";
@@ -52,32 +52,61 @@ ${knowledgeBase}
 - 社群平台: ${request.platform}
 ${request.style ? `- 補充說明: ${request.style}` : ""}
 
-請根據知識庫內容,為用戶生成以下三個部分:
+請根據知識庫內容,為用戶生成以下三個部分。
 
-1. 帳號定位 (150-200字)
-   - 分析用戶的主題和目標受眾
-   - 給出清晰的帳號定位建議
-   - 說明如何在紅海中脫穎而出
+重要:請嚴格按照以下格式輸出,使用「===」作為分隔符號:
 
-2. 選題建議 (3-5個選題)
-   - 基於知識庫的熱門話題類型
-   - 每個選題包含標題和簡短說明
-   - 符合用戶的影片目標
+===POSITIONING_START===
+[帳號定位內容]
 
-3. 腳本範例 (一個完整的30秒腳本)
-   - 使用 Hook → Value → CTA 結構
-   - 包含時間軸和分鏡建議
-   - 可直接使用的逐字稿
+分段清楚，短句，每段換行，適度加入表情符號。
 
-重要輸出規範:
-- 不要使用 Markdown 粗體符號 (**、__)
-- 不要使用 Markdown 標題符號 (#、##)
-- 列點使用「•」或「-」,不要用 *
-- 可以使用 emoji 讓內容更生動
+包含以下內容:
+1. 目標受眾分析
+2. 內容定位建議
+3. 風格調性建議
+4. 競爭優勢分析
+5. 具體執行建議
+===POSITIONING_END===
+
+===TOPICS_START===
+[選題建議]
+
+分段清楚，短句，每段換行，適度加入表情符號。
+
+提供 3-5 個熱門選題方向，每個選題包含:
+1. 選題標題
+2. 具體建議
+3. 選題策略和技巧
+4. 內容規劃建議
+5. 執行時程建議
+===TOPICS_END===
+
+===SCRIPT_START===
+[完整的30秒腳本範例]
+
+分段清楚，短句，每段換行，適度加入表情符號。
+
+包含以下結構:
+1. 主題標題
+2. Hook（開場鉤子）
+3. Value（核心價值內容）
+4. CTA（行動呼籲）
+5. 畫面感描述
+6. 發佈文案
+===SCRIPT_END===
+
+格式要求（非常重要）:
+- 分段清楚，短句，每段換行
+- 適度加入表情符號
+- 絕對不要使用 ** 或任何 Markdown 格式符號
+- 不要使用 # ## ### 等標題符號
+- 列點使用「•」或「-」
 - 用自然、口語化的方式表達
 - 保持專業但親切的語氣
+- 避免口頭禪
 
-請直接開始生成,不要有任何前言或解釋。`;
+請嚴格按照上述格式生成，不要有任何前言或解釋。直接開始輸出 ===POSITIONING_START===。`;
 
   try {
     const response = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
@@ -107,13 +136,16 @@ ${request.style ? `- 補充說明: ${request.style}` : ""}
     if (!response.ok) {
       const errorText = await response.text();
       console.error("[Gemini] API error:", errorText);
-      throw new Error(`Gemini API error: ${response.status}`);
+      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
     }
 
     const data = await response.json();
+    console.log("[Gemini] API response:", JSON.stringify(data, null, 2));
+    
     const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
     if (!generatedText) {
+      console.error("[Gemini] No content in response. Full response:", JSON.stringify(data, null, 2));
       throw new Error("No content generated from Gemini API");
     }
 
@@ -127,52 +159,78 @@ ${request.style ? `- 補充說明: ${request.style}` : ""}
 }
 
 /**
- * 解析 Gemini 生成的內容,分割成帳號定位、選題建議、腳本範例
+ * 解析 Gemini 生成的內容,使用分隔符號提取三個部分
  */
 function parseGeneratedContent(text: string): GenerateResponse {
-  // 簡單的分割邏輯,根據關鍵字分段
-  const sections = text.split(/\n\n+/);
-  
   let positioning = "";
   let topics = "";
   let script = "";
   
-  let currentSection = "";
+  // 使用分隔符號提取內容
+  const positioningMatch = text.match(/===POSITIONING_START===([\s\S]*?)===POSITIONING_END===/);  
+  const topicsMatch = text.match(/===TOPICS_START===([\s\S]*?)===TOPICS_END===/);  
+  const scriptMatch = text.match(/===SCRIPT_START===([\s\S]*?)===SCRIPT_END===/);  
   
-  for (const section of sections) {
-    const lowerSection = section.toLowerCase();
-    
-    if (lowerSection.includes("帳號定位") || lowerSection.includes("定位")) {
-      currentSection = "positioning";
-      continue;
-    } else if (lowerSection.includes("選題") || lowerSection.includes("主題")) {
-      currentSection = "topics";
-      continue;
-    } else if (lowerSection.includes("腳本") || lowerSection.includes("劇本")) {
-      currentSection = "script";
-      continue;
-    }
-    
-    if (currentSection === "positioning") {
-      positioning += section + "\n\n";
-    } else if (currentSection === "topics") {
-      topics += section + "\n\n";
-    } else if (currentSection === "script") {
-      script += section + "\n\n";
-    }
+  if (positioningMatch) {
+    positioning = positioningMatch[1].trim();
   }
   
-  // 如果解析失敗,嘗試簡單分割
-  if (!positioning && !topics && !script) {
-    const parts = text.split(/\n\n\n+/);
-    positioning = parts[0] || text.substring(0, 500);
-    topics = parts[1] || text.substring(500, 1000);
-    script = parts[2] || text.substring(1000);
+  if (topicsMatch) {
+    topics = topicsMatch[1].trim();
+  }
+  
+  if (scriptMatch) {
+    script = scriptMatch[1].trim();
+  }
+  
+  // 如果使用分隔符號解析失敗,嘗試備用方案
+  if (!positioning || !topics || !script) {
+    console.warn("[Gemini] Failed to parse with delimiters, trying fallback method");
+    
+    // 備用方案:根據關鍵字分段
+    const lines = text.split('\n');
+    let currentSection = "";
+    let positioningLines: string[] = [];
+    let topicsLines: string[] = [];
+    let scriptLines: string[] = [];
+    
+    for (const line of lines) {
+      const lowerLine = line.toLowerCase();
+      
+      if (lowerLine.includes("帳號定位") || lowerLine.includes("定位建議")) {
+        currentSection = "positioning";
+        continue;
+      } else if (lowerLine.includes("選題建議") || lowerLine.includes("熱門選題")) {
+        currentSection = "topics";
+        continue;
+      } else if (lowerLine.includes("腳本範例") || lowerLine.includes("完整腳本")) {
+        currentSection = "script";
+        continue;
+      }
+      
+      if (currentSection === "positioning" && line.trim()) {
+        positioningLines.push(line);
+      } else if (currentSection === "topics" && line.trim()) {
+        topicsLines.push(line);
+      } else if (currentSection === "script" && line.trim()) {
+        scriptLines.push(line);
+      }
+    }
+    
+    if (!positioning && positioningLines.length > 0) {
+      positioning = positioningLines.join('\n');
+    }
+    if (!topics && topicsLines.length > 0) {
+      topics = topicsLines.join('\n');
+    }
+    if (!script && scriptLines.length > 0) {
+      script = scriptLines.join('\n');
+    }
   }
   
   return {
-    positioning: positioning.trim() || "生成失敗,請重試",
-    topics: topics.trim() || "生成失敗,請重試",
-    script: script.trim() || "生成失敗,請重試",
+    positioning: positioning || "生成失敗,請重試",
+    topics: topics || "生成失敗,請重試",
+    script: script || "生成失敗,請重試",
   };
 }

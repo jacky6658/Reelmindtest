@@ -48,11 +48,23 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input }) => {
-        const result = await handlePreorderSubmission(input);
-        if (!result.success) {
-          throw new Error("提交失敗，請稍後再試");
+        try {
+          const result = await handlePreorderSubmission(input);
+          
+          // 即使部分失敗也返回結果，讓前端知道發生什麼事
+          if (!result.success) {
+            console.error("[Preorder] Submission partially failed:", result);
+            // 只有兩個都失敗才拋錯誤
+            if (!result.sheetsWritten && !result.webhookSent) {
+              throw new Error("提交失敗，請稍後再試");
+            }
+          }
+          
+          return result;
+        } catch (error) {
+          console.error("[Preorder] Mutation error:", error);
+          throw error;
         }
-        return result;
       }),
   }),
 });
