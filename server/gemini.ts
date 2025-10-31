@@ -4,8 +4,8 @@ import axios from "axios";
 import { AXIOS_TIMEOUT_MS } from "@shared/const";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-// 使用 v1 API + gemini-pro（最基礎、最通用的模型，應該所有專案都支援）
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent";
+// 使用 v1beta API + gemini-2.5-flash-preview（從 API 列表查詢到的可用模型）
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent";
 
 // —— 輕量 RAG：載入知識庫、分塊與檢索 ——
 let knowledgeBaseFull: string = "";
@@ -177,8 +177,7 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
   ].filter(Boolean).join(" \n ");
 
   // —— 併發限制（避免多人同時使用時觸發 503）——
-  // 注意：由於改為串行執行，這裡主要防止多個用戶同時請求
-  const MAX_CONCURRENT = 1; // 串行模式下，每個用戶的請求也是串行的，所以設為 1
+  const MAX_CONCURRENT = 3; // 允許同時 3 個請求（三段並行生成）
   let active = (globalThis as any).__gemini_active__ || 0;
   const setActive = (v: number) => ((globalThis as any).__gemini_active__ = v);
   
@@ -189,8 +188,7 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
     active += 1;
     setActive(active);
     try {
-      // 在請求前加一個小延遲，避免同時發送
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // 移除延遲，讓請求更快
       return await fn();
     } finally {
       active -= 1;
@@ -199,8 +197,9 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
   }
 
   // 配置 axios 實例（統一的重試與錯誤處理）
+  // Gemini API 生成長內容需要更長時間，使用 60 秒超時
   const axiosInstance = axios.create({
-    timeout: AXIOS_TIMEOUT_MS,
+    timeout: 60000, // 60 秒（長內容生成需要更長時間）
     headers: { "Content-Type": "application/json" },
   });
 
@@ -310,13 +309,13 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
         } : null,
       }, null, 2));
     
-      // 檢查是否有候選回應
-      if (!data.candidates || data.candidates.length === 0) {
+    // 檢查是否有候選回應
+    if (!data.candidates || data.candidates.length === 0) {
         console.warn(`[Gemini] ${segmentName}: No candidates, returning placeholder`);
         return `[${segmentName}] 生成失敗，請稍後再試。`;
-      }
+    }
 
-      const candidate = data.candidates[0];
+    const candidate = data.candidates[0];
       const finishReason = candidate?.finishReason;
       
       // 允許 MAX_TOKENS（可能還有部分內容）
@@ -332,23 +331,77 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
             // 檢查不同的文字欄位
             if (typeof p?.text === "string") return p.text;
             if (typeof p?.text?.content === "string") return p.text.content;
+            // 有些回應可能是直接的字串
+            if (typeof p === "string") return p;
             return "";
           })
           .filter(Boolean)
           .join("\n")
           .trim();
         
-        if (text) {
-          console.log(`[Gemini] ${segmentName}: Generated ${text.length} chars`);
-          return text;
+        if (text && text.length > 10) { // 確保有足夠內容（至少 10 個字符）
+          // 清理 Markdown 符號：移除 **、#、##、### 等
+          const cleanedText = text
+            .replace(/\*\*/g, '') // 移除 ** 粗體
+            .replace(/\*/g, '')   // 移除單個 *（可能是列表標記）
+            .replace(/#{1,6}\s*/g, '') // 移除標題符號 #、##、### 等
+            .replace(/__/g, '') // 移除 __ 粗體
+            .replace(/~~/g, '') // 移除 ~~ 刪除線
+            .trim();
+          console.log(`[Gemini] ${segmentName}: Generated ${cleanedText.length} chars`);
+          return cleanedText;
+        } else if (text) {
+          console.warn(`[Gemini] ${segmentName}: Generated text too short (${text.length} chars):`, text);
         }
       }
       
-      // 如果 parts 是空的，嘗試直接從 candidate 提取
-      const directText = candidate?.content?.text || candidate?.text;
-      if (directText && typeof directText === "string") {
-        console.log(`[Gemini] ${segmentName}: Generated ${directText.length} chars (direct text)`);
-        return directText.trim();
+      // 如果 parts 是空的或太短，嘗試從其他地方提取
+      // 檢查 candidate.content 的其他可能格式
+      const contentText = candidate?.content?.text || 
+                          candidate?.content?.content ||
+                          candidate?.text ||
+                          candidate?.output;
+      if (contentText && typeof contentText === "string" && contentText.length > 10) {
+        // 清理 Markdown 符號
+        const cleanedText = contentText
+          .replace(/\*\*/g, '')
+          .replace(/\*/g, '')
+          .replace(/#{1,6}\s*/g, '')
+          .replace(/__/g, '')
+          .replace(/~~/g, '')
+          .trim();
+        console.log(`[Gemini] ${segmentName}: Generated ${cleanedText.length} chars (alternative format)`);
+        return cleanedText;
+      }
+      
+      // 嘗試從整個 candidate 物件中提取文字（遞歸搜索）
+      const extractTextFromObj = (obj: any): string => {
+        if (typeof obj === "string") return obj;
+        if (Array.isArray(obj)) {
+          return obj.map(extractTextFromObj).filter(Boolean).join("\n");
+        }
+        if (obj && typeof obj === "object") {
+          // 優先檢查常見的文字欄位
+          if (obj.text && typeof obj.text === "string") return obj.text;
+          if (obj.content && typeof obj.content === "string") return obj.content;
+          // 遞歸搜索
+          return Object.values(obj).map(extractTextFromObj).filter(Boolean).join("\n");
+        }
+        return "";
+      };
+      
+      const extractedText = extractTextFromObj(candidate?.content || candidate);
+      if (extractedText && extractedText.length > 10) {
+        // 清理 Markdown 符號
+        const cleanedText = extractedText
+          .replace(/\*\*/g, '')
+          .replace(/\*/g, '')
+          .replace(/#{1,6}\s*/g, '')
+          .replace(/__/g, '')
+          .replace(/~~/g, '')
+          .trim();
+        console.log(`[Gemini] ${segmentName}: Generated ${cleanedText.length} chars (deep extraction)`);
+        return cleanedText;
       }
 
       // 如果沒有內容，返回占位訊息
@@ -414,7 +467,15 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
 - 影片目標：${request.goal}
 - 社群平台：${request.platform}${request.style ? `\n- 補充說明：${request.style}` : ""}`;
 
-  const formatGuide = `\n\n語氣與格式要求：口語自然、短句換行；可少量使用 emoji；禁止任何 Markdown 標記（**、#、##）。`;
+  const formatGuide = `\n\n語氣與格式要求：
+- 使用繁體中文（台灣正體字），絕對不要使用簡體字
+- 口語自然、短句換行
+- 可少量使用 emoji
+- 禁止任何 Markdown 標記：絕對不要使用 **、*、#、##、###、__、~~ 等符號
+- 不要使用粗體、斜體、標題等格式符號
+- 直接用純文字表達，列點用「•」或「-」，不要用 * 或數字列表
+- 不要有任何前言或開場白（如「好的，這是一些...」），直接開始輸出內容
+- 格式必須固定，每次輸出保持一致的結構`;
 
   // 三段獨立的 prompt（每段都明確包含使用者需求與對應知識庫）
   const positioningPrompt = `${userInput}${formatGuide}
@@ -438,39 +499,31 @@ ${scriptContext || "（無相關知識庫內容）"}
 
 請針對「${request.topic}」的主題、「${request.targetAudience}」的受眾、「${request.goal}」的目標、「${request.platform}」的平台特性${request.style ? `、「${request.style}」的風格要求` : ""}，包含：主題標題、Hook、Value、CTA、畫面感、發佈文案。`;
 
-  // 方案C：三段串行生成（避免同時發送多個請求觸發 rate limit）
-  // 串行執行可以避免觸發 Gemini API 的 rate limit
-  console.log("[Gemini] Starting 3-segment generation (positioning, topics, script) - sequential mode...");
+  // 方案D：三段並行生成（速度快）+ 併發限制（避免 503）
+  // 使用 Promise.allSettled 確保即使部分失敗也能返回其他成功的部分
+  console.log("[Gemini] Starting 3-segment generation (positioning, topics, script) - parallel mode...");
   
-  let positioning: string;
-  let topics: string;
-  let script: string;
+  // 並行執行：三個請求同時發送（但受併發限制控制，最多 3 個）
+  // Positioning 需要包含：受眾洞察、定位建議、風格調性、競爭優勢、具體行動建議，內容較長
+  // Topics 需要生成 3-5 個選題，每個選題都要包含：標題、具體建議、策略/技巧、內容規劃、時程建議
+  const [positioningResult, topicsResult, scriptResult] = await Promise.allSettled([
+    generateSegment(positioningPrompt, 3072, "Positioning"), // 從 2048 增加到 3072
+    generateSegment(topicsPrompt, 4096, "Topics"),
+    generateSegment(scriptPrompt, 4096, "Script"),
+  ]);
   
-  // 串行執行：一個完成後再執行下一個
-  try {
-    positioning = await generateSegment(positioningPrompt, 1200, "Positioning");
-    console.log("[Gemini] Positioning completed, waiting 1s before next segment...");
-    await new Promise(resolve => setTimeout(resolve, 1000)); // 請求間延遲 1 秒
-  } catch (error: any) {
-    console.error("[Gemini] Positioning segment error (fallback):", error.message?.substring(0, 50));
-    positioning = "帳號定位：生成過程中遇到問題，請稍後再試。";
-  }
+  // 提取結果（即使部分失敗也返回成功的部分）
+  const positioning = positioningResult.status === 'fulfilled' 
+    ? positioningResult.value 
+    : "帳號定位：生成過程中遇到問題，請稍後再試。";
   
-  try {
-    topics = await generateSegment(topicsPrompt, 1500, "Topics");
-    console.log("[Gemini] Topics completed, waiting 1s before next segment...");
-    await new Promise(resolve => setTimeout(resolve, 1000)); // 請求間延遲 1 秒
-  } catch (error: any) {
-    console.error("[Gemini] Topics segment error (fallback):", error.message?.substring(0, 50));
-    topics = "選題建議：生成過程中遇到問題，請稍後再試。";
-  }
+  const topics = topicsResult.status === 'fulfilled'
+    ? topicsResult.value
+    : "選題建議：生成過程中遇到問題，請稍後再試。";
   
-  try {
-    script = await generateSegment(scriptPrompt, 2000, "Script");
-  } catch (error: any) {
-    console.error("[Gemini] Script segment error (fallback):", error.message?.substring(0, 50));
-    script = "腳本範例：生成過程中遇到問題，請稍後再試。";
-  }
+  const script = scriptResult.status === 'fulfilled'
+    ? scriptResult.value
+    : "腳本範例：生成過程中遇到問題，請稍後再試。";
 
   console.log(`[Gemini] Generation completed - P:${positioning.length}, T:${topics.length}, S:${script.length} chars`);
 

@@ -11,9 +11,9 @@ interface PreorderData {
   additionalInfo?: string;
 }
 
-const GOOGLE_SHEETS_ID = "1D7mQgVJEFYvKzSjorVRjPQo6bDC8fQK4FMqEJguEet4";
-const GOOGLE_API_KEY = "AIzaSyChvuiJO57ULSWN9meXtyGQm7cWenBGlrM";
-const N8N_WEBHOOK_URL = "https://aicraft.app.n8n.cloud/webhook/feb1666a-2356-4e03-8b10-43fdce3514e4";
+const GOOGLE_SHEETS_ID = process.env.GOOGLE_SHEETS_ID || "1D7mQgVJEFYvKzSjorVRjPQo6bDC8fQK4FMqEJguEet4";
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || "";
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "https://aicraft.app.n8n.cloud/webhook/feb1666a-2356-4e03-8b10-43fdce3514e4";
 
 /**
  * Write data to Google Sheets
@@ -21,6 +21,11 @@ const N8N_WEBHOOK_URL = "https://aicraft.app.n8n.cloud/webhook/feb1666a-2356-4e0
  * For production, consider using Service Account authentication
  */
 async function writeToGoogleSheets(data: PreorderData): Promise<boolean> {
+  if (!GOOGLE_API_KEY) {
+    console.warn("[Google Sheets] GOOGLE_API_KEY not configured, skipping write");
+    return false;
+  }
+  
   try {
     const timestamp = new Date().toISOString();
     const row = [
