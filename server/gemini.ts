@@ -4,8 +4,8 @@ import axios from "axios";
 import { AXIOS_TIMEOUT_MS } from "@shared/const";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-// 使用 v1beta API（支援 -latest 後綴），v1 不支援 -latest
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent";
+// 使用 v1beta API，直接使用模型名稱（不加 -latest）
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
 
 // —— 輕量 RAG：載入知識庫、分塊與檢索 ——
 let knowledgeBaseFull: string = "";
