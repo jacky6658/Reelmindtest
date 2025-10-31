@@ -198,7 +198,7 @@ export default function Generate() {
 
               <Button
                 size="lg"
-                className="w-full bg-white text-blue-700 hover:bg-white/90"
+                className="w-full bg-white text-blue-700 border-2 border-blue-600 hover:bg-blue-50"
                 onClick={() => setStep(2)}
                 disabled={!formData.topic || !formData.targetAudience || !formData.goal || !formData.platform}
               >
