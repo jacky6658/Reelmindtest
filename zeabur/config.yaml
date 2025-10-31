@@ -1,0 +1,7 @@
+service:
+  type: nodejs
+  build:
+    command: pnpm install && pnpm build
+  start:
+    command: pnpm start
+  port: 3000
