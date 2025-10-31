@@ -3,6 +3,7 @@ import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
 import { generateContent } from "./gemini";
+import { handlePreorderSubmission } from "./preorder";
 import { z } from "zod";
 
 export const appRouter = router({
@@ -32,6 +33,25 @@ export const appRouter = router({
       )
       .mutation(async ({ input }) => {
         const result = await generateContent(input);
+        return result;
+      }),
+  }),
+
+  preorder: router({
+    submit: publicProcedure
+      .input(
+        z.object({
+          email: z.string().email(),
+          teamSize: z.string().min(1),
+          useCase: z.string().min(1),
+          additionalInfo: z.string().optional(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        const result = await handlePreorderSubmission(input);
+        if (!result.success) {
+          throw new Error("提交失敗，請稍後再試");
+        }
         return result;
       }),
   }),
