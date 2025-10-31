@@ -176,17 +176,19 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
   ].filter(Boolean).join(" \n ");
 
   // —— 方案B：併發限制（避免多人同時使用時觸發 503）——
-  const MAX_CONCURRENT = 3;
+  const MAX_CONCURRENT = 2; // 降低到 2，減少 503 發生率
   let active = (globalThis as any).__gemini_active__ || 0;
   const setActive = (v: number) => ((globalThis as any).__gemini_active__ = v);
   
   async function withSemaphore<T>(fn: () => Promise<T>): Promise<T> {
     while (active >= MAX_CONCURRENT) {
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await new Promise(resolve => setTimeout(resolve, 500)); // 增加等待間隔
     }
     active += 1;
     setActive(active);
     try {
+      // 在請求前加一個小延遲，避免同時發送
+      await new Promise(resolve => setTimeout(resolve, 100));
       return await fn();
     } finally {
       active -= 1;
@@ -237,10 +239,13 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
       if (config.__retryCount < 3) {
         config.__retryCount += 1;
         
-        // 503/429 用更長的延遲（指數退避）
-        const delay = (status === 503 || status === 429) 
-          ? 2000 * config.__retryCount  // 2秒、4秒、6秒
-          : 1000 * config.__retryCount; // 1秒、2秒、3秒
+        // 503/429 用更長的延遲（指數退避 + 隨機抖動）
+        const baseDelay = (status === 503 || status === 429) 
+          ? 3000 * config.__retryCount  // 3秒、6秒、9秒（增加延遲）
+          : 1500 * config.__retryCount; // 1.5秒、3秒、4.5秒
+        // 加入隨機抖動（±20%），避免所有請求同時重試
+        const jitter = baseDelay * 0.2 * (Math.random() * 2 - 1);
+        const delay = Math.max(1000, baseDelay + jitter);
         
         const errorMsg = error.response?.data?.error?.message || error.message || 'Unknown error';
         console.warn(
