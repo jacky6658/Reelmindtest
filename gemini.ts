@@ -188,12 +188,38 @@ ${request.style ? `- 補充說明: ${request.style}` : ""}
       console.error("[Gemini] Generation stopped with reason:", candidate.finishReason);
       throw new Error(`Content generation stopped: ${candidate.finishReason}`);
     }
-    
-    const generatedText = candidate?.content?.parts?.[0]?.text || "";
 
+    // 優先聚合所有 parts 文字（有些回應會拆多個 parts）
+    let generatedText = "";
+    const parts = candidate?.content?.parts;
+    if (Array.isArray(parts) && parts.length > 0) {
+      generatedText = parts
+        .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+    }
+
+    // 若沒有 parts 或文字，嘗試從所有 candidates 聚合文字
+    if (!generatedText && Array.isArray(data.candidates)) {
+      generatedText = data.candidates
+        .flatMap((c: any) => (Array.isArray(c?.content?.parts) ? c.content.parts : []))
+        .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+    }
+
+    // 若仍無文字，且為 MAX_TOKENS 或內容缺失，回傳可用的占位內容而非直接丟錯
     if (!generatedText) {
-      console.error("[Gemini] No text content in response. Full response:", JSON.stringify(data, null, 2));
-      throw new Error("No content generated from Gemini API");
+      console.warn("[Gemini] No text content parsed – returning partial placeholders.");
+      const partialMessage =
+        "內容被截斷或未成功返回，請減少輸入長度或稍後再試。";
+      return {
+        positioning: partialMessage,
+        topics: partialMessage,
+        script: partialMessage,
+      };
     }
 
     // 解析生成的內容,分割成三個部分
