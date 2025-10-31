@@ -200,41 +200,66 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
     headers: { "Content-Type": "application/json" },
   });
 
+  // 重試機制：自動處理 503/429/500 和網路錯誤
   axiosInstance.interceptors.response.use(
     (response) => response,
     async (error) => {
-      const config = error.config;
-      const shouldRetry = 
-        !config?.__retryCount &&
-        (
-          (error.response?.status === 503 || 
-           error.response?.status === 429 || 
-           error.response?.status === 500) ||
-          error.code === 'EAI_AGAIN' ||
-          error.code === 'ENOTFOUND' ||
-          error.code === 'ETIMEDOUT' ||
-          error.code === 'ECONNRESET' ||
-          error.message?.includes('getaddrinfo') ||
-          error.message?.includes('timeout') ||
-          (error.cause && (error.cause.code === 'EAI_AGAIN' || error.cause.code === 'ENOTFOUND'))
-        );
+      // 確保 config 存在（某些錯誤可能沒有 config）
+      if (!error.config) {
+        return Promise.reject(error);
+      }
       
-      if (shouldRetry) {
-        config.__retryCount = config.__retryCount || 0;
+      const config = error.config;
+      const status = error.response?.status;
+      const errorCode = error.code;
+      
+      // 判斷是否是可重試的錯誤
+      const isRetryableError = 
+        status === 503 || 
+        status === 429 || 
+        status === 500 ||
+        errorCode === 'EAI_AGAIN' ||
+        errorCode === 'ENOTFOUND' ||
+        errorCode === 'ETIMEDOUT' ||
+        errorCode === 'ECONNRESET' ||
+        error.message?.includes('getaddrinfo') ||
+        error.message?.includes('timeout') ||
+        (error.cause && (error.cause.code === 'EAI_AGAIN' || error.cause.code === 'ENOTFOUND'));
+      
+      if (!isRetryableError) {
+        return Promise.reject(error);
+      }
+      
+      // 取得當前重試次數（如果沒有則初始化）
+      config.__retryCount = config.__retryCount || 0;
+      
+      // 如果未超過重試次數，則重試
+      if (config.__retryCount < 3) {
         config.__retryCount += 1;
         
-        if (config.__retryCount <= 3) {
-          const baseDelay = error.response?.status === 503 || error.response?.status === 429 
-            ? 2000 * config.__retryCount
-            : 1000 * config.__retryCount;
-          console.warn(
-            `[Gemini] ${error.response?.status ? `HTTP ${error.response.status}` : 'Network'} error, retrying (${config.__retryCount}/3) after ${baseDelay}ms...`, 
-            error.response?.data?.error?.message || error.message
-          );
-          await new Promise(resolve => setTimeout(resolve, baseDelay));
-          return axiosInstance(config);
-        }
+        // 503/429 用更長的延遲（指數退避）
+        const delay = (status === 503 || status === 429) 
+          ? 2000 * config.__retryCount  // 2秒、4秒、6秒
+          : 1000 * config.__retryCount; // 1秒、2秒、3秒
+        
+        const errorMsg = error.response?.data?.error?.message || error.message || 'Unknown error';
+        console.warn(
+          `[Gemini] ${status ? `HTTP ${status}` : `Network (${errorCode})`} error, retrying (${config.__retryCount}/3) after ${delay}ms...`,
+          errorMsg.substring(0, 100)
+        );
+        
+        await new Promise(resolve => setTimeout(resolve, delay));
+        
+        // 重試請求（使用相同的 config）
+        return axiosInstance(config);
       }
+      
+      // 超過重試次數，記錄失敗
+      console.error(`[Gemini] Failed after ${config.__retryCount} retries:`, {
+        status,
+        code: errorCode,
+        message: error.response?.data?.error?.message || error.message,
+      });
       
       return Promise.reject(error);
     }
@@ -296,18 +321,41 @@ export async function generateContent(request: GenerateRequest): Promise<Generat
         ? `[${segmentName}] 內容達到長度限制，請稍後再試。`
         : `[${segmentName}] 生成失敗，請稍後再試。`;
     } catch (error: any) {
-      console.error(`[Gemini] ${segmentName} error:`, error);
+      // 記錄詳細錯誤資訊（包含重試次數）
+      const retryCount = error.config?.__retryCount || 0;
+      const errorCode = error.response?.status || error.code;
+      const errorMessage = error.response?.data?.error?.message || error.message || '';
       
-      const cause = error.cause || {};
-      const errorCode = error.code || cause.code || error.response?.status;
-      const errorMessage = error.message || cause.message || error.response?.data?.error?.message || '';
+      if (retryCount > 0) {
+        console.error(`[Gemini] ${segmentName} error after ${retryCount} retries:`, {
+          code: errorCode,
+          message: errorMessage,
+          status: error.response?.status,
+        });
+      } else {
+        console.error(`[Gemini] ${segmentName} error:`, {
+          code: errorCode,
+          message: errorMessage,
+          status: error.response?.status,
+        });
+      }
       
+      // 根據錯誤類型回傳友善的錯誤訊息
       if (errorCode === 503 || errorMessage.includes('overloaded')) {
-        throw new Error("Gemini 模型目前過載，請稍後再試。");
+        throw new Error("Gemini 模型目前過載，請稍後再試。如果問題持續，可能是 Google API 服務暫時不可用。");
       }
       
       if (errorCode === 429) {
         throw new Error("請求過於頻繁，請稍後再試。");
+      }
+      
+      // 網路錯誤
+      if (error.code === 'EAI_AGAIN' || error.code === 'ENOTFOUND') {
+        throw new Error("無法連接到 Gemini API，請檢查網絡連接或稍後再試。");
+      }
+      
+      if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+        throw new Error("請求超時，請稍後再試。");
       }
       
       throw new Error(`${segmentName} 生成失敗: ${errorMessage || '請稍後再試'}`);
@@ -356,68 +404,60 @@ ${scriptContext || "（無相關知識庫內容）"}
     // 方案B：三段並行生成（但受併發限制控制）
     console.log("[Gemini] Starting 3-segment generation (positioning, topics, script)...");
     
-    const [positioning, topics, script] = await Promise.all([
+    const [positioning, topics, script] = await Promise.allSettled([
       generateSegment(positioningPrompt, 1200, "Positioning"),
       generateSegment(topicsPrompt, 1500, "Topics"),
       generateSegment(scriptPrompt, 2000, "Script"),
     ]);
 
-    console.log(`[Gemini] All segments generated - P:${positioning.length}, T:${topics.length}, S:${script.length} chars`);
-
-    return {
-      positioning: positioning || "生成失敗，請重試",
-      topics: topics || "生成失敗，請重試",
-      script: script || "生成失敗，請重試",
+    // 處理結果（即使部分失敗也能回傳其他成功的部分）
+    const result = {
+      positioning: positioning.status === 'fulfilled' ? positioning.value : "生成失敗，請稍後再試",
+      topics: topics.status === 'fulfilled' ? topics.value : "生成失敗，請稍後再試",
+      script: script.status === 'fulfilled' ? script.value : "生成失敗，請稍後再試",
     };
+
+    console.log(`[Gemini] Generation completed - P:${result.positioning.length}, T:${result.topics.length}, S:${result.script.length} chars`);
+
+    // 如果所有段都失敗，才拋錯
+    if (positioning.status === 'rejected' && topics.status === 'rejected' && script.status === 'rejected') {
+      const firstError = positioning.reason || topics.reason || script.reason;
+      throw firstError;
+    }
+
+    return result;
   } catch (error: any) {
     console.error("[Gemini] Generation error:", error);
     
     // 提供更友好的錯誤訊息
-    const cause = error.cause || {};
-    const errorCode = error.code || cause.code || error.response?.status;
-    const errorMessage = error.message || cause.message || error.response?.data?.error?.message || '';
+    const errorCode = error.response?.status || error.code;
+    const errorMessage = error.response?.data?.error?.message || error.message || '未知錯誤';
     
-    // 處理網絡/DNS 錯誤
-    if (errorCode === 'EAI_AGAIN' || errorCode === 'ENOTFOUND' || errorMessage.includes('getaddrinfo')) {
-      throw new Error("無法連接到 Gemini API，請檢查網絡連接或稍後再試。如果問題持續，請聯繫管理員。");
+    // 處理 503 錯誤（已重試 3 次後仍失敗）
+    if (errorCode === 503 || errorMessage.includes('overloaded')) {
+      throw new Error("Gemini 模型目前過載，已重試多次仍失敗，請稍後再試。");
     }
     
-    // 處理超時錯誤
-    if (errorCode === 'ETIMEDOUT' || errorCode === 'ECONNABORTED' || errorMessage.includes('timeout')) {
+    // 處理 429 錯誤
+    if (errorCode === 429) {
+      throw new Error("請求過於頻繁，請稍後再試。");
+    }
+    
+    // 處理網絡錯誤
+    if (errorCode === 'EAI_AGAIN' || errorCode === 'ENOTFOUND') {
+      throw new Error("無法連接到 Gemini API，請檢查網絡連接。");
+    }
+    
+    if (errorCode === 'ETIMEDOUT' || errorCode === 'ECONNABORTED') {
       throw new Error("請求超時，請稍後再試。");
     }
     
-    // 處理連接重置錯誤
-    if (errorCode === 'ECONNRESET' || errorMessage.includes('reset')) {
+    if (errorCode === 'ECONNRESET') {
       throw new Error("連接被重置，請稍後再試。");
     }
     
-    // 處理 HTTP 錯誤響應
-    if (error.response) {
-      const status = error.response.status;
-      const statusText = error.response.statusText || '';
-      const apiError = error.response.data?.error;
-      
-      // 特別處理 503 錯誤（模型過載）
-      if (status === 503) {
-        throw new Error("Gemini 模型目前過載，請稍後再試。如果問題持續，可能是 Google API 服務暫時不可用。");
-      }
-      
-      // 處理 429 錯誤（請求過多）
-      if (status === 429) {
-        throw new Error("請求過於頻繁，請稍後再試。");
-      }
-      
-      // 處理其他 HTTP 錯誤
-      throw new Error(`Gemini API 錯誤 (${status} ${statusText}): ${apiError?.message || errorMessage || '請稍後再試'}`);
-    }
-    
-    // 處理其他網絡錯誤
-    if (errorMessage.includes('Network Error') || errorMessage.includes('network')) {
-      throw new Error("網絡請求失敗，請檢查網絡連接或稍後再試。");
-    }
-    
-    throw error;
+    // 其他錯誤
+    throw new Error(`生成內容失敗: ${errorMessage}`);
   }
 }
 
