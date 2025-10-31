@@ -1,5 +1,7 @@
 import { readFileSync } from "fs";
 import { join } from "path";
+import axios from "axios";
+import { AXIOS_TIMEOUT_MS } from "@shared/const";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
@@ -109,12 +111,50 @@ ${request.style ? `- 補充說明: ${request.style}` : ""}
 請嚴格按照上述格式生成，不要有任何前言或解釋。直接開始輸出 ===POSITIONING_START===。`;
 
   try {
-    const response = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
-      method: "POST",
+    // 使用 axios 代替 fetch，提供更好的錯誤處理和重試機制
+    // 配置 axios 實例，設置超時和重試
+    const axiosInstance = axios.create({
+      timeout: AXIOS_TIMEOUT_MS,
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
+    });
+
+    // 添加響應攔截器來處理錯誤
+    axiosInstance.interceptors.response.use(
+      (response) => response,
+      async (error) => {
+        const config = error.config;
+        
+        // 如果是網絡錯誤（DNS、連接等），進行重試
+        if (
+          !config?.__retryCount &&
+          (error.code === 'EAI_AGAIN' ||
+           error.code === 'ENOTFOUND' ||
+           error.code === 'ETIMEDOUT' ||
+           error.code === 'ECONNRESET' ||
+           error.message?.includes('getaddrinfo') ||
+           error.message?.includes('timeout') ||
+           (error.cause && (error.cause.code === 'EAI_AGAIN' || error.cause.code === 'ENOTFOUND')))
+        ) {
+          config.__retryCount = config.__retryCount || 0;
+          config.__retryCount += 1;
+          
+          if (config.__retryCount <= 3) {
+            const delay = 1000 * config.__retryCount; // 指數退避
+            console.warn(`[Gemini] Network error, retrying (${config.__retryCount}/3) after ${delay}ms...`, error.message);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return axiosInstance(config);
+          }
+        }
+        
+        return Promise.reject(error);
+      }
+    );
+
+    const response = await axiosInstance.post(
+      `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`,
+      {
         contents: [
           {
             parts: [
@@ -130,16 +170,10 @@ ${request.style ? `- 補充說明: ${request.style}` : ""}
           topP: 0.95,
           maxOutputTokens: 8192,
         },
-      }),
-    });
+      }
+    );
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("[Gemini] API error:", errorText);
-      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
-    }
-
-    const data = await response.json();
+    const data = response.data;
     console.log("[Gemini] API response:", JSON.stringify(data, null, 2));
     
     // 檢查是否有候選回應
@@ -165,8 +199,41 @@ ${request.style ? `- 補充說明: ${request.style}` : ""}
     // 解析生成的內容,分割成三個部分
     const result = parseGeneratedContent(generatedText);
     return result;
-  } catch (error) {
+  } catch (error: any) {
     console.error("[Gemini] Generation error:", error);
+    
+    // 提供更友好的錯誤訊息
+    const cause = error.cause || {};
+    const errorCode = error.code || cause.code || error.response?.status;
+    const errorMessage = error.message || cause.message || error.response?.data?.error?.message || '';
+    
+    // 處理網絡/DNS 錯誤
+    if (errorCode === 'EAI_AGAIN' || errorCode === 'ENOTFOUND' || errorMessage.includes('getaddrinfo')) {
+      throw new Error("無法連接到 Gemini API，請檢查網絡連接或稍後再試。如果問題持續，請聯繫管理員。");
+    }
+    
+    // 處理超時錯誤
+    if (errorCode === 'ETIMEDOUT' || errorCode === 'ECONNABORTED' || errorMessage.includes('timeout')) {
+      throw new Error("請求超時，請稍後再試。");
+    }
+    
+    // 處理連接重置錯誤
+    if (errorCode === 'ECONNRESET' || errorMessage.includes('reset')) {
+      throw new Error("連接被重置，請稍後再試。");
+    }
+    
+    // 處理 HTTP 錯誤響應
+    if (error.response) {
+      const status = error.response.status;
+      const statusText = error.response.statusText || '';
+      throw new Error(`Gemini API 錯誤 (${status} ${statusText}): ${errorMessage || '請稍後再試'}`);
+    }
+    
+    // 處理其他網絡錯誤
+    if (errorMessage.includes('Network Error') || errorMessage.includes('network')) {
+      throw new Error("網絡請求失敗，請檢查網絡連接或稍後再試。");
+    }
+    
     throw error;
   }
 }

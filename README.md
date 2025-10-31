@@ -104,6 +104,8 @@ git push origin main
 | `DATABASE_URL` | ✅ | 資料庫連線字串 |
 | `JWT_SECRET` | ✅ | JWT 簽章密鑰 |
 | `NODE_ENV` | ❌ | 環境 (development/production) |
+| `OAUTH_SERVER_URL` | ❌ | OAuth 服務器 URL（如未設置會有警告） |
+| `VITE_APP_LOGO` | ❌ | 應用 Logo URL（默認為 `/aijob-logo.png`） |
 
 ## 🔧 可用指令
 
